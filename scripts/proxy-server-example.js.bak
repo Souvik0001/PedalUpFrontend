@@ -1,0 +1,73 @@
+/**
+ * Cookie Rewrite Proxy Server (Node.js)
+ *
+ * Rewrites backend cookie from "token" to "refreshToken"
+ * so the /auth/refresh endpoint can find the refresh token.
+ *
+ * Without this proxy, token refresh will fail because:
+ * - Backend sets: Set-Cookie: token=<JWT>
+ * - Frontend refresh endpoint expects: cookie named "refreshToken"
+ *
+ * Usage:
+ *   npm install http-proxy express cors
+ *   node proxy-server-example.js
+ *
+ * Then set in frontend .env.local:
+ *   REACT_APP_API_BASE=http://localhost:3001
+ */
+
+const express = require("express")
+const { createProxyMiddleware } = require("express-http-proxy")
+const cors = require("cors")
+
+const app = express()
+
+// CORS configuration
+app.use(
+  cors({
+    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  }),
+)
+
+// Cookie rewrite middleware
+app.use((req, res, next) => {
+  const originalSend = res.send
+
+  res.send = function (data) {
+    // Intercept Set-Cookie headers
+    if (res.getHeader("set-cookie")) {
+      const cookies = res.getHeader("set-cookie")
+      const rewrittenCookies = Array.isArray(cookies)
+        ? cookies.map((cookie) => cookie.replace(/^token=/i, "refreshToken="))
+        : cookies.replace(/^token=/i, "refreshToken=")
+
+      res.setHeader("set-cookie", rewrittenCookies)
+      console.log("[Proxy] Cookie rewritten:", rewrittenCookies)
+    }
+
+    res.send = originalSend
+    return originalSend.call(this, data)
+  }
+
+  next()
+})
+
+// Proxy all requests to backend
+app.use(
+  "/",
+  createProxyMiddleware({
+    target: process.env.BACKEND_URL || "http://localhost:8080",
+    changeOrigin: true,
+    logLevel: "debug",
+  }),
+)
+
+const PORT = process.env.PORT || 3001
+app.listen(PORT, () => {
+  console.log(`\n🔄 Proxy server listening on http://localhost:${PORT}`)
+  console.log(`📍 Forwarding to backend: http://localhost:8080`)
+  console.log(`🍪 Cookie rewrite: token → refreshToken\n`)
+})
