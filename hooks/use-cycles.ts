@@ -14,48 +14,56 @@ export function useCycles() {
 
   const fetchCycles = useCallback(async () => {
     if (!isAuthenticated) return
-
     setIsLoading(true)
     setError(null)
     try {
-      console.log("[v0] Fetching cycles...")
-      const response = await cycleApi.getAll()
-      console.log("[v0] Cycles fetched successfully:", response.data.length)
-      setCycles(response.data)
-    } catch (err: any) {
-      const errorMessage =
-        err.response?.status === 401
-          ? "Session expired. Please login again."
-          : err.response?.status === 500
-            ? "Server error. Please try again later."
-            : err.message || "Failed to load cycles"
+      const res = await cycleApi.getAll()
 
-      setError(errorMessage)
-      console.error("[v0] Error fetching cycles:", err.response?.status, err.message)
+      // Unwrap possible { data: [...] } response
+      const payload: any = res?.data
+      const list = Array.isArray(payload?.data)
+        ? payload.data
+        : (Array.isArray(payload) ? payload : [])
 
-      // Only clear if it's an auth error, let the api-client handle the 401 redirect
+      // Normalize geometry: add { lat, lng } from coordinates [lng, lat]
+      const normalized: CycleDto[] = list.map((c: any) => {
+        const coords = c?.currentLocation?.coordinates
+        if (Array.isArray(coords) && coords.length >= 2) {
+          const lng = Number(coords[0])
+          const lat = Number(coords[1])
+          return {
+            ...c,
+            currentLocation: {
+              ...c.currentLocation,
+              lat,
+              lng,
+            },
+          }
+        }
+        return c
+      })
+
+      setCycles(normalized)
+
+      // handy debug if you want to inspect in DevTools
+      if (typeof window !== "undefined") (window as any).pedalUpCycles = normalized
+    } catch (e: any) {
+      setError(e?.response?.data?.message || "Failed to fetch cycles")
+      setCycles([]) // keep array to avoid .filter crash elsewhere
     } finally {
       setIsLoading(false)
     }
   }, [isAuthenticated])
 
-  const getCycleById = useCallback(async (id: number) => {
-    try {
-      const response = await cycleApi.getById(id)
-      return response.data
-    } catch (err) {
-      console.error("[v0] Error fetching cycle:", err)
-      throw err
-    }
-  }, [])
+  const getCycleById = useCallback(
+    (id: string | number) => {
+      const idNum = typeof id === "string" ? Number(id) : id
+      return cycles.find((c) => c.id === idNum || c.cycleId === id)
+    },
+    [cycles]
+  )
 
   useEffect(() => {
-    if (!isAuthenticated) {
-      setCycles([])
-      setError(null)
-      return
-    }
-
     fetchCycles()
     const interval = setInterval(fetchCycles, 30000)
     return () => clearInterval(interval)

@@ -1,8 +1,16 @@
-// Axios instance with token refresh interceptor
+// Axios instance with token refresh interceptor (Next.js friendly)
 import axios, { type AxiosInstance, type AxiosError, type InternalAxiosRequestConfig } from "axios"
 import type { AuthResponse } from "./types"
 
-const API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:8080"
+// Next.js exposes only NEXT_PUBLIC_* vars to the browser
+// Put in .env.local: NEXT_PUBLIC_API_BASE=http://localhost:3001
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "http://localhost:3001").trim()
+
+// Small runtime log so you can verify in DevTools
+if (typeof window !== "undefined") {
+  console.log("[PedalUp] API base:", API_BASE)
+  ;(window as any).__PEDALUP_API_BASE__ = API_BASE
+}
 
 let tokenExpiresAt: number | null = null
 let isRefreshing = false
@@ -12,9 +20,8 @@ let tokenChangeCallbacks: Array<(token: string | null) => void> = []
 const subscribeTokenRefresh = (callback: (token: string) => void) => {
   refreshSubscribers.push(callback)
 }
-
 const onTokenRefreshed = (token: string) => {
-  refreshSubscribers.forEach((callback) => callback(token))
+  refreshSubscribers.forEach((cb) => cb(token))
   refreshSubscribers = []
 }
 
@@ -24,47 +31,42 @@ export const subscribeToTokenChanges = (callback: (token: string | null) => void
     tokenChangeCallbacks = tokenChangeCallbacks.filter((cb) => cb !== callback)
   }
 }
-
 const notifyTokenChange = (token: string | null) => {
-  tokenChangeCallbacks.forEach((callback) => callback(token))
+  tokenChangeCallbacks.forEach((cb) => cb(token))
 }
 
-// Create axios instance
+// Always go through the proxy (3001) so cookies/refresh work
 const apiClient: AxiosInstance = axios.create({
   baseURL: API_BASE,
-  headers: {
-    "Content-Type": "application/json",
-  },
-  withCredentials: true, // Important for cookie-based refresh
+  headers: { "Content-Type": "application/json" },
+  withCredentials: true,
 })
 
-// Request interceptor: add access token
+// Add bearer token
 apiClient.interceptors.request.use(
   (config: InternalAxiosRequestConfig) => {
     const token = typeof window !== "undefined" ? localStorage.getItem("accessToken") : null
     if (token && config.url && !config.url.includes("/auth/login") && !config.url.includes("/auth/signup")) {
-      config.headers.Authorization = `Bearer ${token}`
+      config.headers = config.headers ?? {}
+      ;(config.headers as any).Authorization = `Bearer ${token}`
     }
     return config
   },
   (error) => Promise.reject(error),
 )
 
-// Response interceptor: handle token refresh on 401
+// 401 → try refresh → retry once
 apiClient.interceptors.response.use(
   (response) => response,
   async (error: AxiosError) => {
-    const originalRequest = error.config as InternalAxiosRequestConfig & {
-      _retry?: boolean
-    }
+    const originalRequest = error.config as InternalAxiosRequestConfig & { _retry?: boolean }
 
     if (error.response?.status === 401 && originalRequest && !originalRequest._retry) {
       if (isRefreshing) {
-        // Token refresh in progress, queue this request
         return new Promise((resolve) => {
           subscribeTokenRefresh((token: string) => {
             if (originalRequest.headers) {
-              originalRequest.headers.Authorization = `Bearer ${token}`
+              (originalRequest.headers as any).Authorization = `Bearer ${token}`
             }
             resolve(apiClient(originalRequest))
           })
@@ -73,34 +75,21 @@ apiClient.interceptors.response.use(
 
       originalRequest._retry = true
       isRefreshing = true
-
       try {
-        const response = await axios.post<AuthResponse>(
-          `${API_BASE}/auth/refresh`,
-          {},
-          {
-            withCredentials: true, // Send refreshToken cookie
-          },
-        )
+        const resp = await axios.post<AuthResponse>(`${API_BASE}/auth/refresh`, {}, { withCredentials: true })
+        const newToken = resp.data?.data?.accessToken
+        if (!newToken) throw new Error("Token refresh failed: no accessToken in response")
 
-        const newToken = response.data.data?.accessToken
-        if (newToken) {
-          setAccessToken(newToken, 3600) // Default 1 hour expiry
-          onTokenRefreshed(newToken)
+        setAccessToken(newToken, 3600)
+        onTokenRefreshed(newToken)
 
-          if (originalRequest.headers) {
-            originalRequest.headers.Authorization = `Bearer ${newToken}`
-          }
-          return apiClient(originalRequest)
-        } else {
-          throw new Error("Token refresh failed: no accessToken in response")
+        if (originalRequest.headers) {
+          (originalRequest.headers as any).Authorization = `Bearer ${newToken}`
         }
+        return apiClient(originalRequest)
       } catch (refreshError) {
-        console.log("[v0] Token refresh failed on 401 error, redirecting to login")
         clearAccessToken()
-        if (typeof window !== "undefined") {
-          window.location.href = "/login"
-        }
+        if (typeof window !== "undefined") window.location.href = "/login"
         return Promise.reject(refreshError)
       } finally {
         isRefreshing = false
@@ -111,27 +100,31 @@ apiClient.interceptors.response.use(
   },
 )
 
-export const setAccessToken = (token: string, expiresIn: number) => {
-  console.log("[v0] setAccessToken called with token:", !!token, "expiresIn:", expiresIn)
+// ===== Token helpers =====
+export const setAccessToken = (token: string, fallbackTtlSec = 3600) => {
+  if (!token || typeof window === "undefined") return
 
-  if (!token) {
-    console.error("[v0] ERROR: Token is empty or undefined. Check API response structure.")
-    return
+  // derive exp from JWT if present
+  const parseJwtExpMs = (t: string): number | null => {
+    try {
+      const payload = JSON.parse(atob(t.split(".")[1]))
+      if (payload && typeof payload.exp === "number") return payload.exp * 1000
+    } catch {}
+    return null
   }
 
-  if (typeof window !== "undefined") {
-    localStorage.setItem("accessToken", token)
-    localStorage.setItem("tokenExpiresAt", String(Date.now() + expiresIn))
-    tokenExpiresAt = Date.now() + expiresIn
-    notifyTokenChange(token)
-    console.log("[v0] Token stored in localStorage, token present:", !!token, "expires at:", new Date(tokenExpiresAt))
-  }
+  const expMsFromJwt = parseJwtExpMs(token)
+  const expiresAt =
+    expMsFromJwt && expMsFromJwt > Date.now() ? expMsFromJwt : Date.now() + fallbackTtlSec * 1000
+
+  localStorage.setItem("accessToken", token)
+  localStorage.setItem("tokenExpiresAt", String(expiresAt))
+  tokenExpiresAt = expiresAt
+  notifyTokenChange(token)
 }
 
-export const getAccessToken = () => {
-  if (typeof window === "undefined") return null
-  return localStorage.getItem("accessToken")
-}
+export const getAccessToken = () =>
+  typeof window === "undefined" ? null : localStorage.getItem("accessToken")
 
 export const clearAccessToken = () => {
   if (typeof window !== "undefined") {
@@ -145,10 +138,11 @@ export const clearAccessToken = () => {
 
 export const isTokenExpired = () => {
   if (typeof window === "undefined") return true
-  const expiresAtStr = localStorage.getItem("tokenExpiresAt")
-  if (!expiresAtStr) return true
-  const expiresAt = Number.parseInt(expiresAtStr, 10)
-  return Date.now() >= expiresAt - 300000 // Refresh 5 mins before expiry instead of 1
+  const s = localStorage.getItem("tokenExpiresAt")
+  if (!s) return true
+  const expiresAt = Number.parseInt(s, 10)
+  const earlyRefreshBufferMs = 30_000
+  return Date.now() >= expiresAt - earlyRefreshBufferMs
 }
 
 export default apiClient
