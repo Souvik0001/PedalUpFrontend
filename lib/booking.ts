@@ -27,6 +27,26 @@ export function setActiveRide(v: ActiveRide) {
   else localStorage.setItem("activeRide", JSON.stringify(v))
 }
 
+/* ---------------- LED bridge (optional; no-op if disabled) ---------------- */
+
+const LED_ENABLED =
+  String(process.env.NEXT_PUBLIC_LED_BRIDGE_ENABLED ?? "true").toLowerCase() === "true"
+
+const LED_BASE = process.env.NEXT_PUBLIC_LED_BRIDGE_URL || "http://localhost:5055"
+
+function pingBridge(path: "/led/on" | "/led/off") {
+  if (typeof window === "undefined" || !LED_ENABLED) return
+  try {
+    // Fire-and-forget; avoid CORS preflights
+    // eslint-disable-next-line no-void
+    void fetch(`${LED_BASE}${path}`, { method: "GET", mode: "no-cors" })
+  } catch {
+    // optional feature: ignore errors
+  }
+}
+
+/* ---------------- Booking APIs (unchanged logic + LED pings) --------------- */
+
 /**
  * Booking in your backend is a single call:
  * POST /riders/requestRide/{cycleId}
@@ -47,6 +67,9 @@ export async function bookCycle(cycleId: string | number) {
   const rideId = payload?.rideId ?? payload?.id
   if (!rideId) throw new Error("Request ride succeeded but response has no rideId")
 
+  // 🔔 LED ON (optional, non-blocking)
+  pingBridge("/led/on")
+
   // Some responses may also include a request id; pass through if present
   const rideRequestId = payload?.rideRequestId ?? payload?.requestId ?? null
   return { rideRequestId, rideId: Number(rideId) }
@@ -60,5 +83,9 @@ export async function endRide(rideId: number, lat = 22.5731, lng = 88.3642) {
   const res = await apiClient.post(`/riders/endRide/${rideId}`, { endLat: lat, endLng: lng })
   const data = unwrap(res)
   console.debug("[endRide] payload:", data)
+
+  // 🔔 LED OFF (optional, non-blocking)
+  pingBridge("/led/off")
+
   return data ?? null
 }
