@@ -1,16 +1,27 @@
 "use client"
 
-// Hook for fetching and managing cycle data
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import type { CycleDto } from "@/lib/types"
 import { cycleApi } from "@/lib/api-endpoints"
 import { useAuth } from "@/contexts/auth-context"
 
+type LatLng = { lat: number; lng: number }
+
+function normalize(c: any): CycleDto {
+  const loc = c?.currentLocation
+  if (loc && Array.isArray(loc.coordinates)) {
+    const [lng, lat] = loc.coordinates // GeoJSON order
+    return { ...c, currentLocation: { lat, lng } }
+  }
+  return c
+}
+
 export function useCycles() {
+  const { isAuthenticated } = useAuth()
   const [cycles, setCycles] = useState<CycleDto[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const { isAuthenticated } = useAuth()
+  const lastHashRef = useRef<string>("")
 
   const fetchCycles = useCallback(async () => {
     if (!isAuthenticated) return
@@ -18,62 +29,42 @@ export function useCycles() {
     setError(null)
     try {
       const res = await cycleApi.getAll()
+      const payload = (res as any)?.data?.data ?? (res as any)?.data ?? res
+      const list: any[] = Array.isArray(payload?.cycles) ? payload.cycles : payload
 
-      // Unwrap possible { data: [...] } response
-      const payload: any = res?.data
-      const list = Array.isArray(payload?.data)
-        ? payload.data
-        : (Array.isArray(payload) ? payload : [])
+      const normalized = (list || []).map(normalize)
 
-      // Normalize geometry: add { lat, lng } from coordinates [lng, lat]
-      const normalized: CycleDto[] = list.map((c: any) => {
-        const coords = c?.currentLocation?.coordinates
-        if (Array.isArray(coords) && coords.length >= 2) {
-          const lng = Number(coords[0])
-          const lat = Number(coords[1])
-          return {
-            ...c,
-            currentLocation: {
-              ...c.currentLocation,
-              lat,
-              lng,
-            },
-          }
-        }
-        return c
-      })
-
-      setCycles(normalized)
-
-      // handy debug if you want to inspect in DevTools
-      if (typeof window !== "undefined") (window as any).pedalUpCycles = normalized
-    } catch (e: any) {
-      setError(e?.response?.data?.message || "Failed to fetch cycles")
-      setCycles([]) // keep array to avoid .filter crash elsewhere
+      // Only update state if something actually changed (prevents no-op renders)
+      const hash = JSON.stringify(
+        normalized.map((c) => ({
+          id: c.id ?? c.cycleId,
+          lat: (c as any).currentLocation?.lat,
+          lng: (c as any).currentLocation?.lng,
+          available: c.available,
+        }))
+      )
+      if (hash !== lastHashRef.current) {
+        lastHashRef.current = hash
+        setCycles(normalized as CycleDto[])
+        // debug: console.debug("[use-cycles] updated", normalized.map(c => ({id: c.id ?? c.cycleId, ...c.currentLocation})))
+      }
+    } catch (err: any) {
+      const message = err?.response?.data?.message || err?.message || "Failed to load cycles"
+      setError(message)
     } finally {
       setIsLoading(false)
     }
   }, [isAuthenticated])
 
-  const getCycleById = useCallback(
-    (id: string | number) => {
-      const idNum = typeof id === "string" ? Number(id) : id
-      return cycles.find((c) => c.id === idNum || c.cycleId === id)
-    },
-    [cycles]
-  )
-
   useEffect(() => {
     fetchCycles()
-    const interval = setInterval(fetchCycles, 30000)
-    return () => clearInterval(interval)
-  }, [fetchCycles, isAuthenticated])
+    const pollMs =
+      Number(process.env.NEXT_PUBLIC_CYCLES_POLL_MS ?? "") > 0
+        ? Number(process.env.NEXT_PUBLIC_CYCLES_POLL_MS)
+        : 3000 // faster so motion is visible
+    const id = setInterval(fetchCycles, pollMs)
+    return () => clearInterval(id)
+  }, [fetchCycles])
 
-  return {
-    cycles,
-    isLoading,
-    error,
-    fetchCycles,
-    getCycleById,
-  }
+  return { cycles, isLoading, error, fetchCycles,  refresh: fetchCycles }
 }

@@ -17,6 +17,67 @@ export default function MapContainer({ cycles, onCycleSelect, selectedCycle }: M
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [zoom, setZoom] = useState(1)
 
+  // ------- tween (added) -------
+  const TWEEN_MS = 800
+  const lastPosRef = useRef<Map<string | number, { lat: number; lng: number }>>(new Map())
+  const targetPosRef = useRef<Map<string | number, { lat: number; lng: number }>>(new Map())
+  const tweenStartRef = useRef<number>(0)
+  const rafRef = useRef<number | null>(null)
+  // this state is just to trigger redraws during animation;
+  // we don't change any of your render UI based on it.
+  const [animNow, setAnimNow] = useState<number>(0)
+
+  const getKey = (c: CycleDto) => (c.id ?? (c as any).cycleId) as string | number
+
+  // seed/advance tween whenever new cycle positions arrive
+  useEffect(() => {
+    // update targets from incoming cycles
+    cycles.forEach((c) => {
+      const key = getKey(c)
+      const lat = (c as any)?.currentLocation?.lat
+      const lng = (c as any)?.currentLocation?.lng
+      if (typeof lat !== "number" || typeof lng !== "number") return
+      targetPosRef.current.set(key, { lat, lng })
+      // if first time seeing this key, start from the same point to avoid a jump
+      if (!lastPosRef.current.has(key)) {
+        lastPosRef.current.set(key, { lat, lng })
+      }
+    })
+
+    // remove positions for cycles no longer present
+    const currentKeys = new Set(cycles.map(getKey))
+    for (const k of Array.from(lastPosRef.current.keys())) {
+      if (!currentKeys.has(k)) {
+        lastPosRef.current.delete(k)
+        targetPosRef.current.delete(k)
+      }
+    }
+
+    // start tween now
+    tweenStartRef.current = performance.now()
+    if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    const tick = (now: number) => {
+      setAnimNow(now) // causes the draw effect to re-run
+      const t = Math.min(1, (now - tweenStartRef.current) / TWEEN_MS)
+      if (t < 1) {
+        rafRef.current = requestAnimationFrame(tick)
+      } else {
+        // snap last = target at end of tween
+        for (const [k, to] of targetPosRef.current.entries()) {
+          lastPosRef.current.set(k, { ...to })
+        }
+      }
+    }
+    rafRef.current = requestAnimationFrame(tick)
+
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+      rafRef.current = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cycles])
+  // ------- end tween -------
+
   // initial center (visual only; math now uses bounds)
   const CAMPUS_CENTER_INIT = { lat: 22.5726, lng: 88.3639 }
   const [center] = useState(CAMPUS_CENTER_INIT)
@@ -91,6 +152,23 @@ export default function MapContainer({ cycles, onCycleSelect, selectedCycle }: M
     return { x, y }
   }
 
+  // helper to get blended (interpolated) position for a cycle (added)
+  const blendedPos = (c: CycleDto): { lat: number; lng: number } | null => {
+    const key = getKey(c)
+    const from = lastPosRef.current.get(key)
+    const to = targetPosRef.current.get(key)
+    if (!from || !to) {
+      const lat = (c as any)?.currentLocation?.lat
+      const lng = (c as any)?.currentLocation?.lng
+      return typeof lat === "number" && typeof lng === "number" ? { lat, lng } : null
+    }
+    const t = Math.min(1, (animNow - tweenStartRef.current) / TWEEN_MS)
+    return {
+      lat: from.lat + (to.lat - from.lat) * t,
+      lng: from.lng + (to.lng - from.lng) * t,
+    }
+  }
+
   // --- Draw ---
   useEffect(() => {
     const canvas = canvasRef.current
@@ -128,11 +206,11 @@ export default function MapContainer({ cycles, onCycleSelect, selectedCycle }: M
       ctx.stroke()
     }
 
-    // Draw cycles
+    // Draw cycles (using blended positions)
     cycles.forEach((cycle) => {
-      const lat = (cycle as any)?.currentLocation?.lat
-      const lng = (cycle as any)?.currentLocation?.lng
-      if (typeof lat !== "number" || typeof lng !== "number") return
+      const pos = blendedPos(cycle)
+      if (!pos) return
+      const { lat, lng } = pos
 
       const { x, y } = project(lng, lat)
       if (x < 0 || x > CANVAS_WIDTH || y < 0 || y > CANVAS_HEIGHT) return
@@ -164,7 +242,8 @@ export default function MapContainer({ cycles, onCycleSelect, selectedCycle }: M
     ctx.beginPath()
     ctx.arc(CANVAS_WIDTH / 2 + pan.x, CANVAS_HEIGHT / 2 + pan.y, 3, 0, Math.PI * 2)
     ctx.fill()
-  }, [cycles, selectedCycle, pan, zoom, bounds.minLng, bounds.maxLng, bounds.minLat, bounds.maxLat])
+  // add animNow so we redraw every animation frame; everything else is your original deps
+  }, [cycles, selectedCycle, pan, zoom, bounds.minLng, bounds.maxLng, bounds.minLat, bounds.maxLat, animNow])
 
   // --- Interaction handlers (same UX) ---
   const handleMouseDown = () => setIsDragging(true)
@@ -194,10 +273,9 @@ export default function MapContainer({ cycles, onCycleSelect, selectedCycle }: M
 
     const R = 20 // hit radius
     for (const cycle of cycles) {
-      const lat = (cycle as any)?.currentLocation?.lat
-      const lng = (cycle as any)?.currentLocation?.lng
-      if (typeof lat !== "number" || typeof lng !== "number") continue
-      const { x: cx, y: cy } = project(lng, lat)
+      const pos = blendedPos(cycle)
+      if (!pos) continue
+      const { x: cx, y: cy } = project(pos.lng, pos.lat)
       const d = Math.hypot(x - cx, y - cy)
       if (d < R) {
         onCycleSelect(cycle)

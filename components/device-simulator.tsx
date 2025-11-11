@@ -1,234 +1,291 @@
-// Developer panel for simulating Arduino device via Socket.IO
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { initializeSocket, getSocket, onCommandResponse } from "@/lib/socket-client"
 import { useAuth } from "@/contexts/auth-context"
+import { rideApi, cycleApi } from "@/lib/api-endpoints"
+
+type LockState = "locked" | "unlocked"
 
 interface DeviceState {
-  cycleId: string
+  cycleCode: string
   lat: number
   lng: number
-  lock: "locked" | "unlocked"
+  lock: LockState
   battery: number
   isConnected: boolean
+}
+
+const TICK_MS =
+  Number(process.env.NEXT_PUBLIC_DEVICE_TICK_MS ?? "") > 0
+    ? Number(process.env.NEXT_PUBLIC_DEVICE_TICK_MS)
+    : 2000
+
+const STEP_DEG =
+  Number(process.env.NEXT_PUBLIC_DEVICE_STEP_DEG ?? "") > 0
+    ? Number(process.env.NEXT_PUBLIC_DEVICE_STEP_DEG)
+    : 0.0005 // ~55m per tick
+
+function jitter(lat: number, lng: number) {
+  const dLat = (Math.random() - 0.5) * STEP_DEG
+  const dLng = (Math.random() - 0.5) * STEP_DEG
+  return { lat: lat + dLat, lng: lng + dLng }
+}
+
+function getActiveRide(): { rideId: number | null; cycleId: string | null } {
+  try {
+    const raw = localStorage.getItem("activeRide")
+    if (!raw) return { rideId: null, cycleId: null }
+    const parsed = JSON.parse(raw)
+    return {
+      rideId: parsed?.rideId ?? null,
+      cycleId: parsed?.cycleId ? String(parsed.cycleId) : null,
+    }
+  } catch {
+    return { rideId: null, cycleId: null }
+  }
+}
+
+function friendlyError(err: any): string {
+  const status = err?.response?.status
+  const data = err?.response?.data
+  let msg = err?.message || "Unknown error"
+  if (data) {
+    try {
+      msg = typeof data === "string" ? data : JSON.stringify(data)
+    } catch {
+      msg = String(data)
+    }
+  }
+  return status ? `${status} ${msg}` : msg
+}
+
+/** Fetch the current location of a cycle from backend and return {lat,lng}. */
+async function fetchCycleLocationFromServer(cycleCode: string): Promise<{ lat: number; lng: number } | null> {
+  try {
+    const res = await cycleApi.getAll()
+    const payload = (res as any)?.data?.data ?? (res as any)?.data ?? res
+    const list: any[] = Array.isArray(payload?.cycles) ? payload.cycles : payload
+    const found = list?.find((c) => String(c?.cycleId) === String(cycleCode))
+    if (!found) return null
+
+    // Normalize GeoJSON -> {lat,lng}
+    const loc = found?.currentLocation
+    if (loc?.coordinates && Array.isArray(loc.coordinates)) {
+      const [lng, lat] = loc.coordinates
+      if (typeof lat === "number" && typeof lng === "number") return { lat, lng }
+    }
+    // Already in {lat,lng}
+    if (typeof loc?.lat === "number" && typeof loc?.lng === "number") {
+      return { lat: loc.lat, lng: loc.lng }
+    }
+  } catch {
+    // ignore, will fall back
+  }
+  return null
 }
 
 export default function DeviceSimulator() {
   const { accessToken } = useAuth()
   const [device, setDevice] = useState<DeviceState>({
-    cycleId: "CYC-1001",
-    lat: 12.9716,
-    lng: 77.5946,
+    cycleCode: "1003", // will be overridden by active ride on start if present
+    // NOTE: these values are only a placeholder; we now prime from server on start
+    lat: 12.971639,
+    lng: 77.594409,
     lock: "locked",
     battery: 87,
     isConnected: false,
   })
-  const [autoUpdate, setAutoUpdate] = useState(false)
   const [commandLog, setCommandLog] = useState<string[]>([])
-  const [isVisible, setIsVisible] = useState(false)
+  const [autoUpdate, setAutoUpdate] = useState(false)
 
-  // Check environment to show only in dev
-  const isDev = process.env.NODE_ENV !== "production"
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const rideIdRef = useRef<number | null>(null)
+  const cycleCodeRef = useRef<string>("")
 
+  // Socket wiring (UI unchanged)
   useEffect(() => {
-    if (!isDev) return
+    if (!accessToken) return
+    initializeSocket(accessToken)
+    const s = getSocket()
+
+    s?.on("connect", () => {
+      setCommandLog((logs) => [...logs, "[SOCKET] connected"])
+      s?.emit("register", {
+        role: "device",
+        cycleId: device.cycleCode,
+        meta: { battery: device.battery, lock: device.lock },
+      })
+      setDevice((d) => ({ ...d, isConnected: true }))
+    })
+
+    s?.on("disconnect", () => {
+      setCommandLog((logs) => [...logs, "[SOCKET] disconnected"])
+      setDevice((d) => ({ ...d, isConnected: false }))
+    })
+
+    const unsubscribe = onCommandResponse((data) => {
+      setCommandLog((logs) => [...logs, `[COMMAND] ${JSON.stringify(data)}`])
+      if (data.command === "unlock") setDevice((d) => ({ ...d, lock: "unlocked" }))
+      if (data.command === "lock") setDevice((d) => ({ ...d, lock: "locked" }))
+    })
 
     return () => {
-      // Cleanup on unmount
+      unsubscribe?.()
+      s?.off("connect")
+      s?.off("disconnect")
     }
-  }, [isDev])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accessToken])
 
-  const handleConnect = async () => {
-    if (!accessToken) {
-      setCommandLog((logs) => [...logs, "[ERROR] No access token"])
-      return
-    }
-
+  async function pushLocation(lat: number, lng: number) {
+    const cycleCode = cycleCodeRef.current || device.cycleCode
     try {
-      const socket = initializeSocket(accessToken)
-      if (socket) {
-        // Register as device
-        socket.emit("register", {
-          role: "device",
-          cycleId: device.cycleId,
-          auth: accessToken,
-        })
-
-        // Listen for commands
-        const unsubscribe = onCommandResponse((data) => {
-          setCommandLog((logs) => [...logs, `[COMMAND] ${JSON.stringify(data)}`])
-
-          if (data.command === "unlock") {
-            setDevice((d) => ({ ...d, lock: "unlocked" }))
-          } else if (data.command === "lock") {
-            setDevice((d) => ({ ...d, lock: "locked" }))
-          }
-        })
-
-        setDevice((d) => ({ ...d, isConnected: true }))
-        setCommandLog((logs) => [...logs, "[CONNECTED] Device connected to relay"])
-
-        return () => unsubscribe()
-      }
-    } catch (error: any) {
-      setCommandLog((logs) => [...logs, `[ERROR] ${error.message}`])
+      await rideApi.updateCycleLocation(
+        cycleCode,              // path uses *string* cycle code (e.g., "1003")
+        lat,
+        lng,
+        rideIdRef.current ?? undefined
+      )
+      setCommandLog((logs) => [
+        ...logs,
+        `[HTTP] push (${cycleCode}) → ${lat.toFixed(5)}, ${lng.toFixed(5)}`
+      ])
+    } catch (err: any) {
+      setCommandLog((logs) => [...logs, `[HTTP] push failed: ${friendlyError(err)}`])
     }
   }
 
-  const handleSendStatus = () => {
-    const socket = getSocket()
-    if (!socket) {
-      setCommandLog((logs) => [...logs, "[ERROR] Socket not connected"])
+  // Auto update loop with **priming from DB** to avoid teleport/overlap
+  useEffect(() => {
+    if (!autoUpdate) {
+      if (timerRef.current != null) window.clearInterval(timerRef.current)
+      timerRef.current = null
       return
     }
 
-    const status = {
-      cycleId: device.cycleId,
-      status: {
-        lat: device.lat,
-        lng: device.lng,
-        lock: device.lock,
-        battery: device.battery,
-        timestamp: Date.now(),
-      },
+    (async () => {
+      // 1) Prefer active ride
+      const { rideId, cycleId } = getActiveRide()
+      rideIdRef.current = rideId
+      cycleCodeRef.current = cycleId || device.cycleCode
+      if (cycleId) setDevice((d) => ({ ...d, cycleCode: cycleId }))
+      setCommandLog((logs) => [
+        ...logs,
+        `[INFO] activeRide rideId=${rideId ?? "null"} cycleId=${cycleId ?? device.cycleCode}`
+      ])
+
+      // 2) PRIME FROM SERVER — read current DB location of this cycle
+      const prime = await fetchCycleLocationFromServer(cycleCodeRef.current)
+      if (prime) {
+        setDevice((d) => ({ ...d, lat: prime.lat, lng: prime.lng }))
+        setCommandLog((logs) => [
+          ...logs,
+          `[INFO] primed from DB → ${prime.lat.toFixed(5)}, ${prime.lng.toFixed(5)}`
+        ])
+      } else {
+        setCommandLog((logs) => [
+          ...logs,
+          `[WARN] could not prime from DB; starting from local state`
+        ])
+      }
+
+      // 3) First push immediately (from primed location)
+      await pushLocation(prime?.lat ?? device.lat, prime?.lng ?? device.lng)
+
+      // 4) Start periodic updates (small random walk)
+      timerRef.current = window.setInterval(async () => {
+        const next = jitter(
+          prime?.lat ?? device.lat,
+          prime?.lng ?? device.lng
+        )
+        // update baseline so we keep walking
+        prime ? ((prime.lat = next.lat), (prime.lng = next.lng)) : setDevice((d) => ({ ...d, lat: next.lat, lng: next.lng }))
+
+        await pushLocation(next.lat, next.lng)
+
+        // also mirror to relay (unchanged)
+        const s = getSocket()
+        s?.emit("status", {
+          cycleId: cycleCodeRef.current,
+          status: {
+            lat: next.lat,
+            lng: next.lng,
+            lock: device.lock,
+            battery: device.battery,
+            timestamp: Date.now(),
+          },
+        })
+      }, TICK_MS)
+    })()
+
+    return () => {
+      if (timerRef.current != null) window.clearInterval(timerRef.current)
+      timerRef.current = null
     }
-
-    socket.emit("status", status)
-    setCommandLog((logs) => [
-      ...logs,
-      `[STATUS] Sent: ${device.cycleId} @ ${device.lat.toFixed(4)}, ${device.lng.toFixed(4)}`,
-    ])
-  }
-
-  const handleToggleLock = () => {
-    setDevice((d) => ({
-      ...d,
-      lock: d.lock === "locked" ? "unlocked" : "locked",
-    }))
-
-    const socket = getSocket()
-    if (socket) {
-      socket.emit("status", {
-        cycleId: device.cycleId,
-        status: {
-          lat: device.lat,
-          lng: device.lng,
-          lock: device.lock === "locked" ? "unlocked" : "locked",
-          battery: device.battery,
-          timestamp: Date.now(),
-        },
-      })
-    }
-  }
-
-  const handleUpdateLocation = () => {
-    setDevice((d) => ({
-      ...d,
-      lat: d.lat + (Math.random() - 0.5) * 0.0005,
-      lng: d.lng + (Math.random() - 0.5) * 0.0005,
-    }))
-  }
-
-  // Auto-update location
-  useEffect(() => {
-    if (!autoUpdate || !device.isConnected) return
-
-    const interval = setInterval(() => {
-      handleUpdateLocation()
-      handleSendStatus()
-    }, 5000)
-
-    return () => clearInterval(interval)
-  }, [autoUpdate, device.isConnected, device.cycleId, device.lat, device.lng, device.lock, device.battery])
-
-  if (!isDev) return null
-
-  if (!isVisible) {
-    return (
-      <button
-        onClick={() => setIsVisible(true)}
-        className="fixed bottom-4 right-4 bg-primary text-primary-foreground px-4 py-2 rounded-lg text-sm hover:bg-primary/90 z-40 shadow-lg"
-      >
-        Dev: Device Simulator
-      </button>
-    )
-  }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoUpdate])
 
   return (
-    <div className="fixed bottom-4 right-4 w-96 z-50">
-      <Card className="bg-card shadow-xl border-2 border-primary">
-        <div className="p-4">
-          <div className="flex justify-between items-center mb-4">
-            <h3 className="font-bold text-foreground">Device Simulator</h3>
-            <button
-              onClick={() => setIsVisible(false)}
-              className="text-muted-foreground hover:text-foreground text-xl leading-none"
-            >
-              ×
-            </button>
-          </div>
-
-          {/* Status */}
-          <div className="space-y-2 mb-4">
-            <div className="flex items-center justify-between text-sm">
-              <span className="text-muted-foreground">Connection:</span>
-              <span className={`font-semibold ${device.isConnected ? "text-green-600" : "text-red-600"}`}>
-                {device.isConnected ? "Connected" : "Disconnected"}
-              </span>
+    <div className="mt-4">
+      <Card className="p-4">
+        <div className="flex items-center justify-between">
+          <div className="space-y-2">
+            <div className="text-sm font-medium">Device Simulator</div>
+            <div className="text-xs text-muted-foreground">
+              Cycle: <span className="font-mono">{device.cycleCode}</span>
             </div>
-            <div className="text-xs text-muted-foreground bg-muted p-2 rounded font-mono">Cycle: {device.cycleId}</div>
-          </div>
-
-          {/* Controls */}
-          <div className="space-y-2 mb-4">
-            <Button
-              onClick={handleConnect}
-              disabled={device.isConnected}
-              className="w-full bg-primary text-primary-foreground"
-              size="sm"
-            >
-              {device.isConnected ? "Connected" : "Connect to Relay"}
-            </Button>
-
-            {device.isConnected && (
-              <>
-                <Button onClick={handleSendStatus} variant="outline" size="sm" className="w-full bg-transparent">
-                  Send Status
-                </Button>
-
-                <Button
-                  onClick={handleToggleLock}
-                  size="sm"
-                  className={`w-full ${
-                    device.lock === "locked" ? "bg-yellow-600 hover:bg-yellow-700" : "bg-green-600 hover:bg-green-700"
-                  } text-white`}
-                >
-                  {device.lock === "locked" ? "Unlock" : "Lock"}
-                </Button>
-
-                <Button onClick={handleUpdateLocation} variant="outline" size="sm" className="w-full bg-transparent">
-                  Update Location
-                </Button>
-
-                <label className="flex items-center gap-2 text-sm p-2 bg-muted rounded">
-                  <input
-                    type="checkbox"
-                    checked={autoUpdate}
-                    onChange={(e) => setAutoUpdate(e.target.checked)}
-                    className="cursor-pointer"
-                  />
-                  <span className="text-foreground">Auto-update (5s)</span>
-                </label>
-              </>
+            {device.isConnected ? (
+              <div className="text-xs text-green-600">connected</div>
+            ) : (
+              <div className="text-xs text-yellow-600">connecting…</div>
             )}
           </div>
 
-          {/* Device Info */}
+          <div className="flex gap-2">
+            {!autoUpdate ? (
+              <Button size="sm" onClick={() => setAutoUpdate(true)}>
+                Start Auto Update
+              </Button>
+            ) : (
+              <Button size="sm" variant="secondary" onClick={() => setAutoUpdate(false)}>
+                Stop Auto Update
+              </Button>
+            )}
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-3">
+          <div className="flex items-center gap-2">
+            <input
+              className="border rounded px-2 py-1 text-sm font-mono w-40"
+              value={device.cycleCode}
+              onChange={(e) => {
+                cycleCodeRef.current = e.target.value
+                setDevice((d) => ({ ...d, cycleCode: e.target.value }))
+              }}
+              placeholder="1003"
+            />
+            <Button
+              size="sm"
+              onClick={() => {
+                const s = getSocket()
+                s?.emit("register", {
+                  role: "device",
+                  cycleId: device.cycleCode,
+                  meta: { battery: device.battery, lock: device.lock },
+                })
+                setCommandLog((logs) => [...logs, "[SOCKET] re-registered"])
+              }}
+            >
+              Re-register
+            </Button>
+          </div>
+
           {device.isConnected && (
-            <div className="bg-muted p-2 rounded text-xs text-muted-foreground mb-4 space-y-1 font-mono">
+            <div className="bg-muted p-2 rounded text-xs text-muted-foreground mb-2 space-y-1 font-mono">
               <div>Lat: {device.lat.toFixed(6)}</div>
               <div>Lng: {device.lng.toFixed(6)}</div>
               <div>Lock: {device.lock}</div>
@@ -236,17 +293,23 @@ export default function DeviceSimulator() {
             </div>
           )}
 
-          {/* Command Log */}
           <div className="bg-muted rounded p-2 max-h-40 overflow-y-auto">
-            <p className="text-xs font-semibold text-muted-foreground mb-1">Log ({commandLog.length})</p>
+            <p className="text-xs font-semibold text-muted-foreground mb-1">
+              Log ({commandLog.length})
+            </p>
             <div className="space-y-1">
-              {commandLog.slice(-5).map((log, idx) => (
+              {commandLog.slice(-12).map((log, idx) => (
                 <div key={idx} className="text-xs text-muted-foreground font-mono truncate">
                   {log}
                 </div>
               ))}
             </div>
           </div>
+
+          <p className="text-xs text-muted-foreground">
+            Tip: Start by booking a cycle (so it&apos;s in-use), then click <span className="font-semibold">Start Auto Update</span>.
+            The simulator now primes from the DB to avoid teleporting and overlapping with other cycles.
+          </p>
         </div>
       </Card>
     </div>
