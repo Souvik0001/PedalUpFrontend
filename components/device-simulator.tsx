@@ -91,7 +91,7 @@ export default function DeviceSimulator() {
   const { accessToken } = useAuth()
   const [device, setDevice] = useState<DeviceState>({
     cycleCode: "1003", // will be overridden by active ride on start if present
-    // NOTE: these values are only a placeholder; we now prime from server on start
+    // NOTE: placeholder; we prime from server on start
     lat: 12.971639,
     lng: 77.594409,
     lock: "locked",
@@ -101,7 +101,8 @@ export default function DeviceSimulator() {
   const [commandLog, setCommandLog] = useState<string[]>([])
   const [autoUpdate, setAutoUpdate] = useState(false)
 
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  // IMPORTANT: In the browser, setInterval returns a number.
+  const timerRef = useRef<number | null>(null)
   const rideIdRef = useRef<number | null>(null)
   const cycleCodeRef = useRef<string>("")
 
@@ -144,7 +145,7 @@ export default function DeviceSimulator() {
     const cycleCode = cycleCodeRef.current || device.cycleCode
     try {
       await rideApi.updateCycleLocation(
-        cycleCode,              // path uses *string* cycle code (e.g., "1003")
+        cycleCode, // path uses *string* cycle code (e.g., "1003")
         lat,
         lng,
         rideIdRef.current ?? undefined
@@ -158,7 +159,7 @@ export default function DeviceSimulator() {
     }
   }
 
-  // Auto update loop with **priming from DB** to avoid teleport/overlap
+  // Auto update loop with priming from DB to avoid teleport/overlap
   useEffect(() => {
     if (!autoUpdate) {
       if (timerRef.current != null) window.clearInterval(timerRef.current)
@@ -202,7 +203,12 @@ export default function DeviceSimulator() {
           prime?.lng ?? device.lng
         )
         // update baseline so we keep walking
-        prime ? ((prime.lat = next.lat), (prime.lng = next.lng)) : setDevice((d) => ({ ...d, lat: next.lat, lng: next.lng }))
+        if (prime) {
+          prime.lat = next.lat
+          prime.lng = next.lng
+        } else {
+          setDevice((d) => ({ ...d, lat: next.lat, lng: next.lng }))
+        }
 
         await pushLocation(next.lat, next.lng)
 
@@ -244,7 +250,7 @@ export default function DeviceSimulator() {
             )}
           </div>
 
-          <div className="flex gap-2">
+        <div className="flex gap-2">
             {!autoUpdate ? (
               <Button size="sm" onClick={() => setAutoUpdate(true)}>
                 Start Auto Update
