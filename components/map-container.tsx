@@ -79,7 +79,8 @@ export default function MapContainer({ cycles, onCycleSelect, selectedCycle }: M
   // ------- end tween -------
 
   // initial center (visual only; math now uses bounds)
-  const CAMPUS_CENTER_INIT = { lat: 22.5726, lng: 88.3639 }
+  // const CAMPUS_CENTER_INIT = { lat: 22.5726, lng: 88.3639 }
+  const CAMPUS_CENTER_INIT = { lat: 12.9692, lng: 79.1559 }
   const [center] = useState(CAMPUS_CENTER_INIT)
 
   const CANVAS_WIDTH = 800
